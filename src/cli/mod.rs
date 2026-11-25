@@ -50,6 +50,18 @@ impl AgentKind {
     }
 }
 
+/// The first `max_chars` characters of `s`, cut on a character boundary.
+///
+/// Session IDs come from files on disk and from a text field, so they are not
+/// guaranteed to be ASCII; slicing them by byte count panics when the cut lands
+/// inside a multi-byte character.
+pub fn char_prefix(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 impl fmt::Display for AgentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ({})", self.display_name(), self.binary_name())
@@ -59,6 +71,14 @@ impl fmt::Display for AgentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn char_prefix_cuts_on_character_boundaries() {
+        assert_eq!(char_prefix("abcdef", 3), "abc");
+        assert_eq!(char_prefix("ab", 3), "ab");
+        assert_eq!(char_prefix("", 3), "");
+        assert_eq!(char_prefix("a\u{e9}\u{e9}\u{e9}", 2), "a\u{e9}");
+    }
 
     #[test]
     fn agent_kind_metadata_is_consistent() {

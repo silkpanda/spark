@@ -1,7 +1,7 @@
 //! Read-only discovery of external CLI sessions (`opencode`, `claude`, `agy`).
 
 use crate::cli::detectors::CliStatus;
-use crate::cli::AgentKind;
+use crate::cli::{char_prefix, AgentKind};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -358,8 +358,7 @@ fn normalize_epoch_secs(raw: u64) -> u64 {
 }
 
 fn short_id(id: &str) -> &str {
-    let end = id.len().min(8);
-    &id[..end]
+    char_prefix(id, 8)
 }
 
 fn compact_title(s: &str) -> String {

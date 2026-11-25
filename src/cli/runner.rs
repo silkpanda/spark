@@ -66,9 +66,22 @@ pub enum StreamEvent {
 /// Handle to a running agent subprocess that allows clean termination.
 pub struct RunningProcess {
     kill_tx: Option<oneshot::Sender<()>>,
+    pid: Option<u32>,
 }
 
 impl RunningProcess {
+    /// Terminate the subprocess and everything it started, before returning.
+    ///
+    /// `cancel()` only asks the runner task to do the kill, which is no use when
+    /// the Tokio runtime is about to be dropped (the app is closing): the task
+    /// never gets to run and the CLI is left working with no window attached.
+    pub fn kill_now(&mut self) {
+        self.kill_tx.take();
+        if let Some(pid) = self.pid.take() {
+            kill_process_tree_blocking(pid);
+        }
+    }
+
     /// Request immediate termination (`Child::kill()`) of the running subprocess.
     ///
     /// Returns `true` if a cancellation signal was sent, or `false` if the
@@ -80,6 +93,41 @@ impl RunningProcess {
             false
         }
     }
+}
+
+/// Kill `pid` and every process descended from it.
+///
+/// `Child::kill()` terminates one process. The agent CLIs are often npm shims
+/// (`opencode.cmd`, `claude.cmd`): the child is `cmd.exe` and the agent is a
+/// grandchild, which survives the kill, keeps working, and holds the output
+/// pipes open so the session never reports that it finished.
+#[cfg(windows)]
+fn taskkill_tree_command(pid: u32) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+#[cfg(windows)]
+fn kill_process_tree_blocking(pid: u32) {
+    let _ = taskkill_tree_command(pid).status();
+}
+
+#[cfg(not(windows))]
+fn kill_process_tree_blocking(_pid: u32) {}
+
+async fn kill_process_tree(child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = Command::from(taskkill_tree_command(pid)).status().await;
+    }
+    let _ = child.kill().await;
 }
 
 /// Construct CLI arguments for non-interactive execution of `req`.
@@ -231,6 +279,7 @@ fn spawn_command(
         .spawn()
         .map_err(|err| format!("Failed to spawn {}: {err}", program.display()))?;
 
+    let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
@@ -283,7 +332,7 @@ fn spawn_command(
         let exit_status = tokio::select! {
             status = child.wait() => status,
             _ = &mut kill_rx => {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 child.wait().await
             }
         };
@@ -312,6 +361,7 @@ fn spawn_command(
 
     Ok(RunningProcess {
         kill_tx: Some(kill_tx),
+        pid,
     })
 }
 
@@ -491,6 +541,97 @@ mod tests {
         }
 
         assert!(saw_finished);
+    }
+
+    /// A command whose real work happens in a grandchild, the way an npm `.cmd`
+    /// shim runs `node`: `cmd.exe` (the child) starts PowerShell and waits on it.
+    #[cfg(windows)]
+    fn shim_like_sleep() -> (&'static Path, Vec<String>) {
+        (
+            Path::new("cmd"),
+            vec![
+                "/C".to_string(),
+                "powershell -NoProfile -Command Write-Output started; Start-Sleep -Seconds 30"
+                    .to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_started(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) {
+        let started = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while let Some(ev) = rx.recv().await {
+                if matches!(&ev, StreamEvent::StdoutLine { line, .. } if line.trim() == "started") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(started, Ok(true), "grandchild never started");
+    }
+
+    #[cfg(windows)]
+    async fn finished_within(rx: &mut mpsc::UnboundedReceiver<StreamEvent>, secs: u64) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(secs), async {
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, StreamEvent::Finished { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancel_stops_a_grandchild_started_through_a_shim() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (program, args) = shim_like_sleep();
+        let mut proc = spawn_command(
+            program,
+            &args,
+            None,
+            "sess-shim".to_string(),
+            AgentKind::OpenCode,
+            tx,
+        )
+        .expect("shim-like command should spawn");
+
+        wait_for_started(&mut rx).await;
+        assert!(proc.cancel());
+
+        assert!(
+            finished_within(&mut rx, 10).await,
+            "Stop killed cmd.exe but the 30 s sleep it started kept running"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kill_now_stops_the_whole_tree_before_returning() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (program, args) = shim_like_sleep();
+        let mut proc = spawn_command(
+            program,
+            &args,
+            None,
+            "sess-exit".to_string(),
+            AgentKind::OpenCode,
+            tx,
+        )
+        .expect("shim-like command should spawn");
+
+        wait_for_started(&mut rx).await;
+        proc.kill_now();
+
+        assert!(
+            finished_within(&mut rx, 10).await,
+            "kill_now returned but the process tree was still running"
+        );
+        assert!(!proc.cancel(), "nothing is left to cancel after kill_now");
     }
 
     #[tokio::test]

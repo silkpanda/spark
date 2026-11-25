@@ -1,6 +1,6 @@
 //! Local project, multi-session continuity, and turn history persistence (`~/.spark/history.json`).
 
-use crate::cli::AgentKind;
+use crate::cli::{char_prefix, AgentKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -104,6 +104,28 @@ impl HistoryStore {
             .map_err(|err| format!("Failed to read history file {}: {err}", path.display()))?;
         serde_json::from_str(&raw)
             .map_err(|err| format!("Failed to parse history file {}: {err}", path.display()))
+    }
+
+    /// Load history at startup without ever destroying a file that failed to load.
+    ///
+    /// The app saves the store straight after loading it, so falling back to an
+    /// empty store on a parse error would overwrite the user's history with
+    /// nothing. A file that cannot be loaded is moved aside first (to
+    /// `history.json.corrupt-<epoch secs>`), and the caller gets a message to show.
+    pub fn load_for_startup(path: &Path) -> (Self, Option<String>) {
+        match Self::load_from(path) {
+            Ok(store) => (store, None),
+            Err(err) => {
+                let backup = path.with_extension(format!("json.corrupt-{}", now_epoch_secs()));
+                let note = match std::fs::rename(path, &backup) {
+                    Ok(()) => format!("{err}. The file was kept as {}", backup.display()),
+                    Err(move_err) => format!(
+                        "{err}. It could not be moved aside ({move_err}); history will not be saved this run"
+                    ),
+                };
+                (Self::default(), Some(note))
+            }
+        }
     }
 
     /// Persist history to `path`, creating parent directories if needed.
@@ -321,11 +343,7 @@ impl HistoryStore {
         let now = now_epoch_secs();
         let clean_title = title.into().trim().to_string();
         let final_title = if clean_title.is_empty() {
-            format!(
-                "{} ({})",
-                agent.display_name(),
-                &cli_id[..cli_id.len().min(8)]
-            )
+            format!("{} ({})", agent.display_name(), char_prefix(&cli_id, 8))
         } else {
             clean_title
         };
@@ -549,6 +567,69 @@ mod tests {
         assert!(err.contains("Failed to parse history file"));
 
         let _ = std::fs::remove_dir_all(corrupt.parent().unwrap());
+    }
+
+    #[test]
+    fn startup_load_keeps_a_history_file_it_could_not_parse() {
+        let path = temp_history_path("startup_corrupt");
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = "{ \"turns\": [ this file was cut off mid-write";
+        std::fs::write(&path, original).unwrap();
+
+        // What the app does on launch: load, then save straight away.
+        let (store, warning) = HistoryStore::load_for_startup(&path);
+        assert_eq!(store, HistoryStore::default());
+        assert!(warning.is_some(), "a failed load must be reported");
+        store.save_to(&path).expect("save should succeed");
+
+        let kept: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter(|content| content == original)
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "the unparseable history must survive the first save, somewhere beside it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_load_of_a_good_or_missing_file_reports_nothing() {
+        let path = temp_history_path("startup_ok");
+        let (store, warning) = HistoryStore::load_for_startup(&path);
+        assert_eq!(store, HistoryStore::default());
+        assert!(warning.is_none());
+
+        let mut saved = HistoryStore::default();
+        saved.create_project("Spark", None);
+        saved.save_to(&path).unwrap();
+        let (loaded, warning) = HistoryStore::load_for_startup(&path);
+        assert_eq!(loaded, saved);
+        assert!(warning.is_none());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn importing_a_session_whose_id_is_not_ascii_does_not_panic() {
+        let mut store = HistoryStore::default();
+        let proj_id = store.create_project("Spark", None).id.clone();
+
+        // Byte 8 of this ID falls inside an "\u{e9}".
+        let uid = store.import_external_session(
+            &proj_id,
+            AgentKind::Agy,
+            "a\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+            "",
+            "",
+        );
+        let title = &store.session_by_uid(&uid).unwrap().title;
+        assert_eq!(title, "Antigravity (a\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9})");
     }
 
     #[test]

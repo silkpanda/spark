@@ -4,7 +4,7 @@ use crate::cli::detectors::{self, CliStatus};
 use crate::cli::models::{self, ModelOption};
 use crate::cli::runner::{self, RunRequest, RunningProcess, StreamEvent};
 use crate::cli::sessions::{self, DiscoveredSession};
-use crate::cli::AgentKind;
+use crate::cli::{char_prefix, AgentKind};
 use crate::history::{HistoryStore, ProjectRecord, SessionRecord, TurnRecord};
 use crate::markdown;
 use crate::theme;
@@ -105,6 +105,13 @@ impl SessionRuntimeState {
             proc.cancel();
         }
     }
+
+    /// Terminate the session's process tree synchronously (used when the app closes).
+    pub fn kill_now(&mut self) {
+        if let Some(proc) = self.process.as_mut() {
+            proc.kill_now();
+        }
+    }
 }
 
 struct NewProjectDraft {
@@ -143,7 +150,11 @@ pub fn session_matches_filters_and_query(
     }
     session.title.to_lowercase().contains(&needle)
         || session.model.to_lowercase().contains(&needle)
-        || session.agent.display_name().to_lowercase().contains(&needle)
+        || session
+            .agent
+            .display_name()
+            .to_lowercase()
+            .contains(&needle)
 }
 
 /// Main Spark desktop application.
@@ -181,11 +192,16 @@ impl SparkApp {
         let runtime = Runtime::new().expect("Tokio runtime should initialize");
         let (ui_tx, ui_rx) = std_mpsc::channel();
 
-        let history_path = HistoryStore::default_path();
-        let mut history = history_path
-            .as_deref()
-            .and_then(|p| HistoryStore::load_from(p).ok())
-            .unwrap_or_default();
+        let mut history_path = HistoryStore::default_path();
+        let (mut history, load_warning) = match history_path.as_deref() {
+            Some(path) => HistoryStore::load_for_startup(path),
+            None => (HistoryStore::default(), None),
+        };
+        // An unreadable file that could not be moved aside is still at `path`.
+        // Saving would overwrite it, so this run keeps its history in memory only.
+        if load_warning.is_some() && history_path.as_deref().is_some_and(|p| p.exists()) {
+            history_path = None;
+        }
 
         let default_dir = std::env::current_dir().ok();
         history.migrate_v01_if_needed(default_dir);
@@ -209,7 +225,7 @@ impl SparkApp {
             prompt: String::new(),
             history,
             history_path,
-            last_error: None,
+            last_error: load_warning,
             detecting: false,
             sidebar_search: String::new(),
             renaming_session_uid: None,
@@ -623,7 +639,10 @@ impl SparkApp {
                             .count();
                         let cli_status = self.cli_statuses.get(&agent);
                         let (dot_color, tooltip) = match cli_status {
-                            None => (theme::TEXT_FAINT, format!("Probing {} CLI...", agent.display_name())),
+                            None => (
+                                theme::TEXT_FAINT,
+                                format!("Probing {} CLI...", agent.display_name()),
+                            ),
                             Some(s) if s.available => (
                                 theme::VERDIGRIS_PATINA,
                                 format!(
@@ -634,9 +653,9 @@ impl SparkApp {
                             ),
                             Some(s) => (
                                 theme::ERROR_CORAL,
-                                s.error
-                                    .clone()
-                                    .unwrap_or_else(|| format!("{} CLI not found", agent.display_name())),
+                                s.error.clone().unwrap_or_else(|| {
+                                    format!("{} CLI not found", agent.display_name())
+                                }),
                             ),
                         };
 
@@ -661,7 +680,11 @@ impl SparkApp {
                         )
                         .fill(Color32::TRANSPARENT)
                         .stroke(Stroke::NONE);
-                        if ui.add(reset_btn).on_hover_text("Show all AI providers").clicked() {
+                        if ui
+                            .add(reset_btn)
+                            .on_hover_text("Show all AI providers")
+                            .clicked()
+                        {
                             self.reset_ai_filters();
                         }
                     }
@@ -704,9 +727,15 @@ impl SparkApp {
                             self.trigger_external_discovery(ctx.clone());
                         }
 
-                        let rescan_label = if self.detecting { "Scanning..." } else { "Scan CLIs" };
+                        let rescan_label = if self.detecting {
+                            "Scanning..."
+                        } else {
+                            "Scan CLIs"
+                        };
                         let scan_btn = egui::Button::new(
-                            RichText::new(rescan_label).size(12.0).color(theme::TEXT_MUTED),
+                            RichText::new(rescan_label)
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
                         )
                         .fill(Color32::TRANSPARENT)
                         .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
@@ -770,7 +799,9 @@ impl SparkApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let add_proj_btn = egui::Button::new(
-                            RichText::new("+ Project").size(11.5).color(theme::TEXT_MUTED),
+                            RichText::new("+ Project")
+                                .size(11.5)
+                                .color(theme::TEXT_MUTED),
                         )
                         .fill(Color32::TRANSPARENT)
                         .stroke(Stroke::new(1.0_f32, theme::HAIRLINE_SUBTLE))
@@ -794,7 +825,11 @@ impl SparkApp {
                     .inner_margin(Margin::symmetric(8, 4))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let clear_w = if self.sidebar_search.is_empty() { 0.0 } else { 20.0 };
+                            let clear_w = if self.sidebar_search.is_empty() {
+                                0.0
+                            } else {
+                                20.0
+                            };
                             let input_w = (ui.available_width() - clear_w).max(60.0);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.sidebar_search)
@@ -952,9 +987,7 @@ impl SparkApp {
                                     ui.horizontal(|ui| {
                                         ui.add_space(16.0);
                                         ui.label(
-                                            RichText::new(msg)
-                                                .size(11.0)
-                                                .color(theme::TEXT_FAINT),
+                                            RichText::new(msg).size(11.0).color(theme::TEXT_FAINT),
                                         );
                                     });
                                 } else {
@@ -1543,9 +1576,7 @@ impl SparkApp {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new(err)
-                                                .color(theme::ERROR_CORAL)
-                                                .size(12.0),
+                                            RichText::new(err).color(theme::ERROR_CORAL).size(12.0),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -1638,8 +1669,11 @@ impl SparkApp {
                                             .width(120.0)
                                             .show_ui(ui, |ui| {
                                                 for opt in ["", "auto", "accept-edits", "plan"] {
-                                                    let label =
-                                                        if opt.is_empty() { "default" } else { opt };
+                                                    let label = if opt.is_empty() {
+                                                        "default"
+                                                    } else {
+                                                        opt
+                                                    };
                                                     if ui
                                                         .selectable_value(
                                                             &mut sess.mode,
@@ -1664,8 +1698,11 @@ impl SparkApp {
                                             .width(115.0)
                                             .show_ui(ui, |ui| {
                                                 for opt in ["", "low", "medium", "high", "max"] {
-                                                    let label =
-                                                        if opt.is_empty() { "default" } else { opt };
+                                                    let label = if opt.is_empty() {
+                                                        "default"
+                                                    } else {
+                                                        opt
+                                                    };
                                                     if ui
                                                         .selectable_value(
                                                             &mut sess.effort,
@@ -1821,16 +1858,13 @@ impl SparkApp {
             .inner_margin(Margin::symmetric(20, 10))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(sess.agent.glyph())
-                            .strong()
-                            .size(17.0)
-                            .color(if is_running {
-                                theme::VERDIGRIS_PATINA
-                            } else {
-                                theme::MIST_BLUE
-                            }),
-                    );
+                    ui.label(RichText::new(sess.agent.glyph()).strong().size(17.0).color(
+                        if is_running {
+                            theme::VERDIGRIS_PATINA
+                        } else {
+                            theme::MIST_BLUE
+                        },
+                    ));
 
                     // Click-to-rename title (clean text by default, TextEdit only while renaming)
                     if self.renaming_session_uid.as_deref() == Some(uid.as_str()) {
@@ -1911,9 +1945,7 @@ impl SparkApp {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new(opt_label)
-                                        .size(11.5)
-                                        .color(theme::TEXT_MUTED),
+                                    RichText::new(opt_label).size(11.5).color(theme::TEXT_MUTED),
                                 )
                                 .fill(opt_fill)
                                 .stroke(opt_stroke)
@@ -1925,7 +1957,11 @@ impl SparkApp {
                         }
 
                         // Formatted / Raw output toggle
-                        let view_label = if self.raw_output_mode { "Raw" } else { "Formatted" };
+                        let view_label = if self.raw_output_mode {
+                            "Raw"
+                        } else {
+                            "Formatted"
+                        };
                         if ui
                             .add(
                                 egui::Button::new(
@@ -1954,7 +1990,11 @@ impl SparkApp {
                             .color(theme::TEXT_MUTED),
                     );
                     if let Some(ver) = cli_status.as_ref().and_then(|s| s.version.as_deref()) {
-                        ui.label(RichText::new(format!("· {ver}")).size(11.5).color(theme::TEXT_FAINT));
+                        ui.label(
+                            RichText::new(format!("· {ver}"))
+                                .size(11.5)
+                                .color(theme::TEXT_FAINT),
+                        );
                     }
                     ui.label(
                         RichText::new(format!("· {current_project_name}"))
@@ -1972,11 +2012,7 @@ impl SparkApp {
                         .on_hover_text(full);
                     }
                     if let Some(cli_id) = &sess.cli_session_id {
-                        let short_id = if cli_id.len() > 14 {
-                            format!("{}...", &cli_id[..14])
-                        } else {
-                            cli_id.clone()
-                        };
+                        let short_id = resume_id_label(cli_id);
                         ui.label(
                             RichText::new(format!("· resume: {short_id}"))
                                 .monospace()
@@ -1996,7 +2032,11 @@ impl SparkApp {
                 .inner_margin(Margin::symmetric(20, 10))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Project:").size(12.0).color(theme::TEXT_MUTED));
+                        ui.label(
+                            RichText::new("Project:")
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        );
                         egui::ComboBox::from_id_salt(("sess_proj", &uid))
                             .selected_text(&current_project_name)
                             .show_ui(ui, |ui| {
@@ -2161,11 +2201,7 @@ impl SparkApp {
         ui.centered_and_justified(|ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.28);
-                ui.label(
-                    RichText::new("◆")
-                        .size(32.0)
-                        .color(theme::MIST_BLUE),
-                );
+                ui.label(RichText::new("◆").size(32.0).color(theme::MIST_BLUE));
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new("Spark Command Deck")
@@ -2221,13 +2257,25 @@ impl eframe::App for SparkApp {
         self.render_sessions_sidebar(ctx);
 
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(theme::OBSIDIAN_BG).inner_margin(Margin::ZERO))
+            .frame(
+                Frame::new()
+                    .fill(theme::OBSIDIAN_BG)
+                    .inner_margin(Margin::ZERO),
+            )
             .show(ctx, |ui| {
                 self.render_focused_session(ui, ctx);
             });
 
         self.render_new_session_window(ctx);
         self.render_import_window(ctx);
+    }
+
+    /// Closing the window must not leave agent CLIs working unattended. The
+    /// runtime is dropped right after this, so the kill cannot be left to a task.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        for rt in self.runtime_sessions.values_mut() {
+            rt.kill_now();
+        }
     }
 }
 
@@ -2288,16 +2336,13 @@ fn render_sidebar_session_row(
                             .color(glyph_color),
                     );
                     ui.add(
-                        egui::Label::new(
-                            RichText::new(&sess.title)
-                                .size(12.5)
-                                .strong()
-                                .color(if is_selected {
-                                    theme::TEXT_BRIGHT
-                                } else {
-                                    theme::TEXT_BODY
-                                }),
-                        )
+                        egui::Label::new(RichText::new(&sess.title).size(12.5).strong().color(
+                            if is_selected {
+                                theme::TEXT_BRIGHT
+                            } else {
+                                theme::TEXT_BODY
+                            },
+                        ))
                         .truncate()
                         .selectable(false),
                     );
@@ -2310,7 +2355,8 @@ fn render_sidebar_session_row(
                     } else {
                         sess.model.clone()
                     };
-                    let meta = if let Some(elapsed) = rt.and_then(|r| format_elapsed(&r.run_state)) {
+                    let meta = if let Some(elapsed) = rt.and_then(|r| format_elapsed(&r.run_state))
+                    {
                         format!("{model_label} · {elapsed}")
                     } else if turn_count > 0 {
                         let unit = if turn_count == 1 { "turn" } else { "turns" };
@@ -2518,9 +2564,11 @@ fn render_empty_session_canvas(
 
         ui.add_space(20.0);
         ui.label(
-            RichText::new("Ctrl+Enter to transmit  ·  Ctrl+N for new session  ·  Click title above to rename")
-                .size(11.5)
-                .color(theme::TEXT_FAINT),
+            RichText::new(
+                "Ctrl+Enter to transmit  ·  Ctrl+N for new session  ·  Click title above to rename",
+            )
+            .size(11.5)
+            .color(theme::TEXT_FAINT),
         );
     });
     rescan
@@ -2615,7 +2663,10 @@ fn render_committed_turn(
                     theme::TEXT_FAINT
                 };
                 if ui
-                    .add(egui::Button::new(RichText::new(label).size(11.0).color(color)).frame(false))
+                    .add(
+                        egui::Button::new(RichText::new(label).size(11.0).color(color))
+                            .frame(false),
+                    )
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .clicked()
                 {
@@ -2685,13 +2736,9 @@ fn render_live_turn(
                 );
                 ui.add_space(4.0);
                 ui.add(
-                    egui::Label::new(
-                        RichText::new(prompt)
-                            .size(13.5)
-                            .color(theme::TEXT_BRIGHT),
-                    )
-                    .selectable(true)
-                    .wrap(),
+                    egui::Label::new(RichText::new(prompt).size(13.5).color(theme::TEXT_BRIGHT))
+                        .selectable(true)
+                        .wrap(),
                 );
             });
         ui.add_space(10.0);
@@ -2734,15 +2781,11 @@ fn render_live_turn(
                 let label = if copied { "Copied" } else { "Copy" };
                 if ui
                     .add(
-                        egui::Button::new(
-                            RichText::new(label)
-                                .size(11.0)
-                                .color(if copied {
-                                    theme::VERDIGRIS_PATINA
-                                } else {
-                                    theme::TEXT_FAINT
-                                }),
-                        )
+                        egui::Button::new(RichText::new(label).size(11.0).color(if copied {
+                            theme::VERDIGRIS_PATINA
+                        } else {
+                            theme::TEXT_FAINT
+                        }))
                         .frame(false),
                     )
                     .clicked()
@@ -2881,6 +2924,16 @@ fn non_empty(s: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// Shorten a CLI session ID for the session header (14 characters, then `...`).
+fn resume_id_label(cli_id: &str) -> String {
+    let head = char_prefix(cli_id, 14);
+    if head.len() < cli_id.len() {
+        format!("{head}...")
+    } else {
+        cli_id.to_string()
     }
 }
 
@@ -3027,6 +3080,18 @@ mod tests {
     }
 
     #[test]
+    fn resume_id_label_shortens_without_splitting_a_character() {
+        assert_eq!(resume_id_label("short-id"), "short-id");
+        assert_eq!(resume_id_label("0123456789abcdef"), "0123456789abcd...");
+        // The session ID field is free text. Byte 14 of this one is inside an "\u{e9}".
+        let pasted = format!("a{}", "\u{e9}".repeat(14));
+        assert_eq!(
+            resume_id_label(&pasted),
+            format!("a{}...", "\u{e9}".repeat(13))
+        );
+    }
+
+    #[test]
     fn non_empty_trims_whitespace() {
         assert_eq!(non_empty("   "), None);
         assert_eq!(non_empty("  sonnet  "), Some("sonnet".to_string()));
@@ -3066,14 +3131,10 @@ mod tests {
         assert!(!session_matches_filters(&archived_agy, &filters));
 
         assert!(session_matches_filters_and_query(
-            &agy_sess,
-            &filters,
-            "hydrogen"
+            &agy_sess, &filters, "hydrogen"
         ));
         assert!(!session_matches_filters_and_query(
-            &agy_sess,
-            &filters,
-            "opus"
+            &agy_sess, &filters, "opus"
         ));
     }
 
