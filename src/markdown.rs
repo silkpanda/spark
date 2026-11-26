@@ -47,9 +47,7 @@ pub fn parse_blocks(input: &str) -> Vec<MarkdownBlock> {
         let trimmed = line.trim_start();
 
         if in_code {
-            if trimmed.starts_with(&code_fence)
-                && trimmed[code_fence.len()..].trim().is_empty()
-            {
+            if trimmed.starts_with(&code_fence) && trimmed[code_fence.len()..].trim().is_empty() {
                 blocks.push(MarkdownBlock::Code {
                     lang: std::mem::take(&mut code_lang),
                     code: code_lines.join("\n"),
@@ -225,7 +223,11 @@ pub fn parse_inline_spans(text: &str) -> Vec<InlineSpan> {
 }
 
 /// Build an `egui::text::LayoutJob` for inline markdown spans.
-pub fn build_inline_layout_job(text: &str, base_color: egui::Color32, size: f32) -> egui::text::LayoutJob {
+pub fn build_inline_layout_job(
+    text: &str,
+    base_color: egui::Color32,
+    size: f32,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let normal_font = FontId::proportional(size);
     let mono_font = FontId::monospace((size - 1.0).max(11.0));
@@ -355,7 +357,11 @@ pub fn render_markdown(
                     .inner_margin(Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let label = if lang.is_empty() { "code" } else { lang.as_str() };
+                            let label = if lang.is_empty() {
+                                "code"
+                            } else {
+                                lang.as_str()
+                            };
                             ui.label(
                                 RichText::new(label)
                                     .monospace()
